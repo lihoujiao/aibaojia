@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import { after, test } from "node:test";
+import { one } from "../lib/db";
+import { createProduct, createQuote, createSku, getActorByPhone, placeOrder, receiveInbound } from "../lib/domain";
+import { handleCreateOrder, handleGetSku } from "../lib/http/handlers";
+import { authed, login, PHONES, readJson, tempDb } from "./helpers";
+
+const ctxPromise = tempDb();
+after(async () => (await ctxPromise).cleanup());
+
+test("过期报价即使创建更晚，也不能当作有效实时价", async () => {
+  await ctxPromise;
+  const actor = await getActorByPhone(PHONES.merchantA);
+  assert.ok(actor);
+  const product = await createProduct(actor, { name: "示例梨", baseUnitLabel: "斤" });
+  assert.equal(product.ok, true);
+  if (!product.ok) return;
+  const sku = await createSku(actor, { productId: product.data.productId, specName: "一级" });
+  assert.equal(sku.ok, true);
+  if (!sku.ok) return;
+  const now = Date.now();
+  const valid = await createQuote(actor, { skuId: sku.data.id, floorPriceCents: 800, validFrom: new Date(now - 2 * 86_400_000).toISOString(), validUntil: new Date(now + 5 * 86_400_000).toISOString() }, { createdAt: new Date(now - 3_600_000) });
+  const expired = await createQuote(actor, { skuId: sku.data.id, floorPriceCents: 1500, validFrom: new Date(now - 10 * 86_400_000).toISOString(), validUntil: new Date(now - 86_400_000).toISOString() }, { createdAt: new Date(now - 1_000) });
+  assert.equal(valid.ok, true);
+  assert.equal(expired.ok, true);
+  if (!valid.ok || !expired.ok) return;
+  const cookie = await login(PHONES.merchantA);
+  const detail = await readJson(await handleGetSku(authed(`/api/skus/${sku.data.id}`, cookie), sku.data.id));
+  const data = detail.body.data as { effective: { quoteId: string; floorPriceCents: number; platformPriceCents: number } | null; quotes: Array<{ id: string; status: string }> };
+  assert.equal(data.effective?.quoteId, valid.data.id);
+  assert.equal(data.effective?.floorPriceCents, 800);
+  assert.equal(data.effective?.platformPriceCents, 840);
+  assert.equal(data.quotes.find((item) => item.id === expired.data.id)?.status, "expired");
+  await receiveInbound(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 1 });
+  const forced = await readJson(await handleCreateOrder(authed("/api/orders", cookie, { method: "POST", body: { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 1, buyerLabel: "示例采购方", idempotencyKey: "q-force", quoteId: expired.data.id } })));
+  assert.equal(forced.status, 400);
+  assert.equal(forced.body.code, "QUOTE_ID_NOT_ALLOWED");
+  const placed = await placeOrder(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 1, buyerLabel: "示例采购方", idempotencyKey: "q-ok" });
+  assert.equal(placed.ok, true);
+  if (!placed.ok) return;
+  assert.equal(placed.data.quote_id, valid.data.id);
+  assert.equal(placed.data.floor_price_cents, 800);
+});
+
+test("只有过期报价时，下单会被拒绝且库存不变", async () => {
+  await ctxPromise;
+  const actor = await getActorByPhone(PHONES.merchantA);
+  assert.ok(actor);
+  const product = await createProduct(actor, { name: "示例过期货", baseUnitLabel: "箱" });
+  assert.equal(product.ok, true);
+  if (!product.ok) return;
+  const sku = await createSku(actor, { productId: product.data.productId, specName: "箱装" });
+  assert.equal(sku.ok, true);
+  if (!sku.ok) return;
+  await receiveInbound(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 4 });
+  await createQuote(actor, { skuId: sku.data.id, floorPriceCents: 900, validFrom: new Date(Date.now() - 5 * 86_400_000).toISOString(), validUntil: new Date(Date.now() - 86_400_000).toISOString() });
+  const placed = await placeOrder(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 1, buyerLabel: "示例采购方", idempotencyKey: "expired-only" });
+  assert.equal(placed.ok, false);
+  if (placed.ok) return;
+  assert.equal(placed.code, "NO_VALID_QUOTE");
+  const stock = await one<{ on_hand_base: number; reserved_base: number }>((await import("../lib/db")).getPool(), "SELECT on_hand_base, reserved_base FROM inventory WHERE sku_id = $1", [sku.data.id]);
+  assert.equal(stock?.on_hand_base, 4);
+  assert.equal(stock?.reserved_base, 0);
+});

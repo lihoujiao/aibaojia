@@ -1,0 +1,41 @@
+import assert from "node:assert/strict";
+import { after, test } from "node:test";
+import { getActorByPhone, createProduct, createQuote, createSku, placeOrder, receiveInbound, confirmOutbound, listLedger } from "../lib/domain";
+import { PHONES, tempDb } from "./helpers";
+
+const ctxPromise = tempDb();
+after(async () => (await ctxPromise).cleanup());
+
+test("入库增加现货，下单预占，出库后现货减少且预占释放，流水可追溯", async () => {
+  await ctxPromise;
+  const actor = await getActorByPhone(PHONES.merchantB);
+  if (!actor) throw new Error("缺少商家乙");
+  const product = await createProduct(actor, { name: "示例玉米", baseUnitLabel: "件" });
+  if (!product.ok) throw new Error(product.message);
+  const sku = await createSku(actor, { productId: product.data.productId, specName: "袋装" });
+  if (!sku.ok) throw new Error(sku.message);
+  await createQuote(actor, { skuId: sku.data.id, floorPriceCents: 1200, validFrom: new Date(Date.now() - 60_000).toISOString(), validUntil: new Date(Date.now() + 86_400_000).toISOString() });
+  const inbound = await receiveInbound(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 5, note: "测试采购" });
+  assert.equal(inbound.ok, true);
+  const order = await placeOrder(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 2, buyerLabel: "示例采购方", idempotencyKey: "led-1" });
+  assert.equal(order.ok, true);
+  if (!order.ok) return;
+  const outbound = await confirmOutbound(actor, order.data.id, { qty: 2, idempotencyKey: "led-out" });
+  assert.equal(outbound.ok, true);
+  if (!outbound.ok) return;
+  assert.equal(outbound.data.onHandBase, 3);
+  const ledger = await listLedger(actor, sku.data.id);
+  assert.equal(ledger.ok, true);
+  if (!ledger.ok) return;
+  const entries = ledger.data.entries;
+  assert.equal(entries.length, 3);
+  const purchase = entries.find((entry) => entry.movementType === "purchase_in");
+  const reserve = entries.find((entry) => entry.movementType === "order_reserve");
+  const sale = entries.find((entry) => entry.movementType === "sale_out");
+  assert.equal(purchase?.actorName, "示例商家乙");
+  assert.equal(reserve?.qtyDelta, 0);
+  assert.equal(sale?.qtyDelta, -2);
+  assert.equal(sale?.onHandAfter, 3);
+  assert.equal(sale?.reservedAfter, 0);
+  assert.match(String(sale?.note), /各减 2/);
+});
