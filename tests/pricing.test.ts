@@ -1,0 +1,65 @@
+import assert from "node:assert/strict";
+import { after, test } from "node:test";
+import { one } from "../lib/db";
+import { confirmOutbound, createProduct, createSku, getActorByPhone, placeOrder, receiveInbound, updateCommission } from "../lib/domain";
+import { handleCreateQuote, handleGetSku, handleUpdateCommission } from "../lib/http/handlers";
+import { commissionCents, platformPriceCents } from "../lib/pricing";
+import { authed, login, PHONES, readJson, tempDb } from "./helpers";
+
+const ctxPromise = tempDb();
+after(async () => (await ctxPromise).cleanup());
+
+test("平台价等于底价加可配置比例佣金，四舍五入到分", () => {
+  assert.equal(commissionCents(10_000, 500), 500);
+  assert.equal(platformPriceCents(10_000, 500), 10_500);
+  assert.equal(commissionCents(333, 500), 17);
+  assert.equal(platformPriceCents(333, 500), 350);
+});
+
+test("商家只能改自己的费率，订单快照不随之后的调整变化", async () => {
+  await ctxPromise;
+  const actor = await getActorByPhone(PHONES.merchantA);
+  const other = await getActorByPhone(PHONES.merchantB);
+  if (!actor || !other) throw new Error("缺少商家");
+  const product = await createProduct(actor, { name: "示例定价果", baseUnitLabel: "斤" });
+  if (!product.ok) throw new Error(product.message);
+  const sku = await createSku(actor, { productId: product.data.productId, specName: "一级" });
+  if (!sku.ok) throw new Error(sku.message);
+  await receiveInbound(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 2 });
+  const cookieA = await login(PHONES.merchantA);
+  const created = await readJson(await handleCreateQuote(authed("/api/quotes", cookieA, { method: "POST", body: { skuId: sku.data.id, floorPriceYuan: "100.00", validFrom: new Date(Date.now() - 60_000).toISOString(), validUntil: new Date(Date.now() + 86_400_000).toISOString() } })));
+  assert.equal(created.status, 200);
+  const price = (created.body.data as { price: { platformPriceCents: number; floorPriceCents: number } }).price;
+  assert.equal(price.floorPriceCents, 10_000);
+  assert.equal(price.platformPriceCents, 10_500);
+  const order = await placeOrder(actor, { skuId: sku.data.id, unitId: sku.data.units[0].id, qty: 1, buyerLabel: "示例采购方", idempotencyKey: "price-1" });
+  assert.equal(order.ok, true);
+  if (!order.ok) return;
+  assert.equal(order.data.platform_price_cents, 10_500);
+  const denied = await updateCommission(actor, "merchant-b", 800);
+  assert.equal(denied.ok, false);
+  const own = await updateCommission(actor, null, 800);
+  assert.equal(own.ok, true);
+  const snapshot = await one<{ platform_price_cents: number }>((await import("../lib/db")).getPool(), "SELECT platform_price_cents FROM orders WHERE id = $1", [order.data.id]);
+  assert.equal(snapshot?.platform_price_cents, 10_500);
+  const cookiePlatform = await login(PHONES.platform);
+  const platformUpdate = await readJson(await handleUpdateCommission(authed("/api/commission", cookiePlatform, { method: "PATCH", body: { merchantId: "merchant-a", commissionPercent: "6.00" } })));
+  assert.equal(platformUpdate.status, 200);
+  const detail = await readJson(await handleGetSku(authed(`/api/skus/${sku.data.id}`, cookiePlatform), sku.data.id));
+  assert.equal((detail.body.data as { effective: { platformPriceCents: number } }).effective.platformPriceCents, 10_600);
+  const later = await updateCommission(actor, null, 900);
+  assert.equal(later.ok, true);
+  const stillEffective = await readJson(await handleGetSku(authed(`/api/skus/${sku.data.id}`, cookiePlatform), sku.data.id));
+  assert.equal((stillEffective.body.data as { effective: { platformPriceCents: number } }).effective.platformPriceCents, 10_600);
+  const rates = await one<{ merchant_bps: number; platform_bps: number }>((await import("../lib/db")).getPool(), "SELECT merchant_bps, platform_bps FROM merchant_commission WHERE merchant_id = 'merchant-a'");
+  assert.equal(rates?.merchant_bps, 900);
+  assert.equal(rates?.platform_bps, 600);
+  const zero = await updateCommission(actor, null, 0);
+  assert.equal(zero.ok, false);
+  if (zero.ok) return;
+  assert.equal(zero.code, "COMMISSION_ZERO_UNCONFIRMED");
+  const sold = await confirmOutbound(actor, order.data.id, { qty: 1, idempotencyKey: "price-out" });
+  assert.equal(sold.ok, true);
+  const still = await one<{ platform_price_cents: number }>((await import("../lib/db")).getPool(), "SELECT platform_price_cents FROM orders WHERE id = $1", [order.data.id]);
+  assert.equal(still?.platform_price_cents, 10_500);
+});
